@@ -17,6 +17,7 @@ use vortex_array::expr::BoundExpression;
 use vortex_array::serde::SerializedArray;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_io::session::RuntimeSessionExt;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
@@ -72,15 +73,22 @@ impl FlatReader {
         let array_tree = self.layout.array_tree().cloned();
         async move {
             let segment = segment_fut.await?;
-            let parts = if let Some(array_tree) = array_tree {
-                // Use the pre-stored flatbuffer from layout metadata combined with segment buffers.
-                SerializedArray::from_flatbuffer_and_segment(array_tree, segment)?
-            } else {
-                // Parse the flatbuffer from the segment itself.
-                SerializedArray::try_from(segment)?
-            };
-            parts
-                .decode(&dtype, row_count, &ctx, &session)
+            // The parse and decode are CPU work: once the segment has arrived they run
+            // wherever the executor runs CPU tasks, not on the I/O runtime that awaited it.
+            let handle = session.handle();
+            handle
+                .spawn_cpu(move || {
+                    let parts = if let Some(array_tree) = array_tree {
+                        // Use the pre-stored flatbuffer from layout metadata combined with
+                        // segment buffers.
+                        SerializedArray::from_flatbuffer_and_segment(array_tree, segment)?
+                    } else {
+                        // Parse the flatbuffer from the segment itself.
+                        SerializedArray::try_from(segment)?
+                    };
+                    parts.decode(&dtype, row_count, &ctx, &session)
+                })
+                .await
                 .map_err(Arc::new)
         }
         .boxed()
